@@ -34,6 +34,8 @@ BSV_DATADIR=/data/bitcoin npm start
 # 3) Verify:
 curl http://127.0.0.1:9201/health
 ```
+> ⚠️ **Needs a *full* bitcoind node** (pruned is fine, ~50 GB) — an **SPV / headers-only** client can't feed the indexer: it reads the UTXO set (`gettxout`), the mempool/raw-tx + block ZMQ firehose, and full blocks (`getblock`), none of which a headers-only node has.
+
 Full setup, environment, systemd, and recovery → **[Operator Handbook](./HANDBOOK.md)**.
 
 ## 🔎 Don't trust, verify — in your browser

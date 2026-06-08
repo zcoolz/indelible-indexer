@@ -70,6 +70,7 @@ npm install
 > `zeromq` is a native module — on Linux install `build-essential` + `python3` first so it can build.
 
 **Node requirements**
+- A **full** `bitcoind` node (pruned is fine) — **not** an SPV / headers-only client. The indexer reads the UTXO set (`gettxout`), the mempool/raw-tx + block ZMQ firehose, and full blocks (`getblock`); a headers-only node has none of those.
 - ZMQ enabled — the indexer subscribes to `rawtx` and `hashblock`:
   ```
   zmqpubrawtx=tcp://127.0.0.1:28332
