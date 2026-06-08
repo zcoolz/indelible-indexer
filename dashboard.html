@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sovereign Indexer</title>
+<style>
+  :root { --bg:#0c0e14; --panel:#141824; --line:#242b3d; --gold:#e0b341; --gold2:#f4d77a; --txt:#d7dce8; --dim:#8a93a8; --ok:#39d98a; --bad:#ff6b6b; --pend:#e0b341; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:26px; margin:0 0 2px; color:var(--gold2); letter-spacing:.5px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:24px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin-bottom:20px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:1.2px; color:var(--gold); margin:0 0 14px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:14px; }
+  .stat .k { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim); }
+  .stat .v { font-size:22px; font-weight:700; color:var(--txt); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; vertical-align:middle; }
+  .dot.up { background:var(--ok); box-shadow:0 0 8px var(--ok); } .dot.down { background:var(--bad); }
+  input { width:100%; background:#0a0c12; border:1px solid var(--line); border-radius:8px; color:var(--txt); padding:11px 12px; font:13px monospace; }
+  button { background:var(--gold); color:#1a1407; border:0; border-radius:8px; padding:11px 18px; font-weight:700; cursor:pointer; margin-top:10px; }
+  button:hover { background:var(--gold2); }
+  .mono { font-family:monospace; font-size:12px; word-break:break-all; }
+  .row { display:flex; gap:10px; align-items:flex-start; padding:6px 0; border-bottom:1px solid var(--line); }
+  .row .lbl { color:var(--dim); min-width:96px; font-size:12px; }
+  .verdict { margin-top:14px; padding:12px 14px; border-radius:8px; font-weight:700; display:none; }
+  .verdict.ok { display:block; background:rgba(57,217,138,.12); border:1px solid var(--ok); color:var(--ok); }
+  .verdict.bad { display:block; background:rgba(255,107,107,.12); border:1px solid var(--bad); color:var(--bad); }
+  .verdict.pend { display:block; background:rgba(224,179,65,.12); border:1px solid var(--pend); color:var(--pend); }
+  .verdict small { display:block; font-weight:400; color:var(--dim); margin-top:4px; }
+  .nodes { margin-top:10px; max-height:200px; overflow:auto; }
+  .nodes div { padding:3px 0; color:var(--dim); font-size:11px; }
+  .foot { text-align:center; color:var(--dim); font-size:12px; margin-top:30px; }
+  .foot b { color:var(--gold); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Sovereign Indexer</h1>
+  <div class="sub">Own the node · own the index · own the proofs — read the chain directly, don't trust, verify.</div>
+
+  <div class="panel">
+    <h2><span id="dot" class="dot down"></span>Status</h2>
+    <div class="grid" id="status">
+      <div class="stat"><div class="k">Node height</div><div class="v" id="s-blocks">—</div></div>
+      <div class="stat"><div class="k">Last block</div><div class="v" id="s-last">—</div></div>
+      <div class="stat"><div class="k">Seen window</div><div class="v" id="s-seen">—</div></div>
+      <div class="stat"><div class="k">Mempool txs</div><div class="v" id="s-mem">—</div></div>
+      <div class="stat"><div class="k">Watched</div><div class="v" id="s-watch">—</div></div>
+      <div class="stat"><div class="k">Pruned</div><div class="v" id="s-pruned">—</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Proof Explorer — verify inclusion in your browser</h2>
+    <input id="txin" placeholder="transaction id (64 hex) — paste an anchor txid" spellcheck="false">
+    <button id="go">Fetch &amp; verify proof</button>
+    <div id="verdict" class="verdict"></div>
+    <div id="pdetail" style="margin-top:14px; display:none">
+      <div class="row"><span class="lbl">block</span><span class="mono" id="p-height"></span></div>
+      <div class="row"><span class="lbl">block hash</span><span class="mono" id="p-bhash"></span></div>
+      <div class="row"><span class="lbl">merkle root</span><span class="mono" id="p-root"></span></div>
+      <div class="row"><span class="lbl">tx index</span><span class="mono" id="p-index"></span></div>
+      <div class="row"><span class="lbl">branch</span><span class="mono" id="p-branchlen"></span></div>
+      <div class="nodes" id="p-nodes"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Address lookup — node-validated UTXOs</h2>
+    <input id="addrin" placeholder="BSV address (1...)" spellcheck="false">
+    <button id="addrgo">Look up</button>
+    <div id="addrout" style="margin-top:12px"></div>
+  </div>
+
+  <div class="foot"><b>Indelible</b> · Sovereign Permanent Memory on Bitcoin SV · generated from our own node, no external indexer</div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id)
+const txt = (el, s) => { el.textContent = s }   // always textContent — no innerHTML with fetched/user data
+
+// ── status (auto-refresh) ──
+async function refresh () {
+  try {
+    const r = await fetch('/health'); const j = await r.json()
+    $('dot').className = 'dot up'
+    txt($('s-blocks'), (j.blocks ?? '—').toLocaleString())
+    txt($('s-last'), j.index?.lastBlock ?? '—')
+    txt($('s-seen'), (j.index?.seen ?? 0).toLocaleString())
+    txt($('s-mem'), (j.index?.memTxs ?? 0).toLocaleString())
+    txt($('s-watch'), j.index?.watched ?? 0)
+    txt($('s-pruned'), j.pruned ? 'yes' : 'no')
+  } catch { $('dot').className = 'dot down' }
+}
+refresh(); setInterval(refresh, 5000)
+
+// ── in-browser SPV verify (crypto.subtle; secure context = localhost or https) ──
+const hexToBytes = (h) => { const a = new Uint8Array(h.length / 2); for (let i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16); return a }
+const bytesToHex = (b) => Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('')
+async function dsha256 (bytes) { const a = await crypto.subtle.digest('SHA-256', bytes); const b = await crypto.subtle.digest('SHA-256', a); return new Uint8Array(b) }
+// Byte-order contract mirrors indexer/merkle.mjs + the bridge's verifyMerkleProof
+// (reverse txid+siblings to LE; even idx → self‖sib, odd → sib‖self; reverse result).
+// Single-tx proof (nodes=[]) correctly returns the bare txid — that IS the merkle root.
+async function recomputeRoot (txid, nodes, index) {
+  let h = hexToBytes(txid); h.reverse()
+  let idx = index
+  for (const n of nodes) {
+    const s = hexToBytes(n); s.reverse()
+    const pair = new Uint8Array(64)
+    if (idx % 2 === 0) { pair.set(h, 0); pair.set(s, 32) } else { pair.set(s, 0); pair.set(h, 32) }
+    h = await dsha256(pair)
+    idx = Math.floor(idx / 2)
+  }
+  return bytesToHex(Uint8Array.from(h).reverse())
+}
+
+function showVerdict (cls, msg, sub) {
+  const v = $('verdict'); v.className = 'verdict ' + cls
+  v.textContent = msg
+  if (sub) { const s = document.createElement('small'); s.textContent = sub; v.appendChild(s) }
+}
+
+async function fetchProof () {
+  const txid = $('txin').value.trim().toLowerCase()
+  $('pdetail').style.display = 'none'
+  if (!/^[0-9a-f]{64}$/.test(txid)) { showVerdict('bad', 'Not a valid txid', 'Need 64 hex characters.'); return }
+  showVerdict('pend', 'Fetching…', '')
+  let r
+  try { r = await fetch('/proof/' + txid) } catch { showVerdict('bad', 'Indexer unreachable', ''); return }
+  if (r.status === 410) { showVerdict('bad', 'Proof orphaned by reorg', 'The block this tx was in is no longer canonical.'); return }
+  if (!r.ok) {
+    let reason = ''; try { reason = (await r.json()).reason } catch {}
+    showVerdict('pend', 'No proof yet', reason === 'pending' ? 'Registered, but the tx is not yet mined into a block.' : 'Unknown txid — not anchored here, or out of window.')
+    return
+  }
+  const p = await r.json()
+  // render details (all textContent)
+  txt($('p-height'), String(p.height))
+  txt($('p-bhash'), p.blockHash)
+  txt($('p-root'), p.merkleRoot)
+  txt($('p-index'), String(p.proof.index))
+  txt($('p-branchlen'), p.proof.nodes.length + ' sibling hashes')
+  const nd = $('p-nodes'); nd.textContent = ''
+  p.proof.nodes.forEach((n, i) => { const d = document.createElement('div'); d.textContent = (i + 1) + '.  ' + n; nd.appendChild(d) })
+  $('pdetail').style.display = 'block'
+  // verify in-browser
+  if (!window.crypto?.subtle) { showVerdict('pend', 'Proof fetched (open via localhost/https to verify in-browser)', ''); return }
+  showVerdict('pend', 'Recomputing root in your browser…', '')
+  try {
+    const got = await recomputeRoot(txid, p.proof.nodes, p.proof.index)
+    if (got === p.merkleRoot) showVerdict('ok', '✓ VERIFIED — recomputed root matches block ' + p.height + "'s header", 'Folded the tx through ' + p.proof.nodes.length + ' siblings → ' + got.slice(0, 16) + '… — independently, in your browser. Don’t trust, verify.')
+    else showVerdict('bad', '✗ MISMATCH — recomputed root does not match', got + ' ≠ ' + p.merkleRoot)
+  } catch (e) { showVerdict('bad', 'Verify error', e.message) }
+}
+$('go').onclick = fetchProof
+$('txin').addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchProof() })
+
+// ── address lookup ──
+async function lookupAddr () {
+  const a = $('addrin').value.trim()
+  const out = $('addrout'); out.textContent = ''
+  if (!/^[13][a-km-zA-HJ-NP-Z1-9]{24,33}$/.test(a)) { out.textContent = 'Not a valid address.'; return }
+  out.textContent = 'Looking up…'
+  try {
+    const r = await fetch('/unspent/' + a); const j = await r.json()
+    const us = j.unspent || []
+    const total = us.reduce((s, u) => s + (u.value || 0), 0)
+    out.textContent = ''
+    const head = document.createElement('div'); head.className = 'mono'
+    head.textContent = us.length + ' UTXO(s) · ' + total.toLocaleString() + ' sats · source: ' + (j.source || '?')
+    out.appendChild(head)
+    us.slice(0, 50).forEach(u => { const d = document.createElement('div'); d.className = 'mono'; d.style.color = 'var(--dim)'; d.style.padding = '3px 0'; d.textContent = u.tx_hash + ':' + u.tx_pos + '  ·  ' + (u.value || 0).toLocaleString() + ' sats'; out.appendChild(d) })
+  } catch { out.textContent = 'Lookup failed.' }
+}
+$('addrgo').onclick = lookupAddr
+$('addrin').addEventListener('keydown', (e) => { if (e.key === 'Enter') lookupAddr() })
+</script>
+</body>
+</html>

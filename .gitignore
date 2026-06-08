@@ -1,0 +1,10 @@
+# dependencies
+node_modules/
+
+# runtime data — the UTXO index rebuilds from ZMQ on restart; proofs persist here
+proofs/
+*.tmp.*
+
+# logs / local env
+*.log
+.env

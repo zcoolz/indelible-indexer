@@ -1,0 +1,28 @@
+{
+  "name": "indelible-indexer",
+  "version": "0.1.0",
+  "description": "Sovereign BSV indexer — read chain truth (UTXOs, balances, tx-existence, Merkle inclusion proofs) from your own node, not a third-party indexer. Runs beside a BSV node (loopback RPC + ZMQ); bridges and apps consume it over HTTP.",
+  "type": "module",
+  "main": "indexer.mjs",
+  "scripts": {
+    "start": "node indexer.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "zeromq": "^6.5.0"
+  },
+  "keywords": [
+    "bsv",
+    "bitcoin",
+    "indexer",
+    "utxo",
+    "spv",
+    "merkle-proof",
+    "zmq",
+    "sovereign"
+  ],
+  "author": "Indelible Federation",
+  "license": "MIT"
+}
