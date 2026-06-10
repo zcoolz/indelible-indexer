@@ -5,7 +5,8 @@
   "type": "module",
   "main": "indexer.mjs",
   "scripts": {
-    "start": "node indexer.mjs"
+    "start": "node indexer.mjs",
+    "test": "node --test chainsync.test.mjs"
   },
   "engines": {
     "node": ">=18"

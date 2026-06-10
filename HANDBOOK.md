@@ -23,6 +23,7 @@ An app asks the chain exactly two things, and they ride different rails:
 ## Architecture
 
 - **ZMQ ingest.** The node publishes a real-time firehose; the indexer subscribes to `rawtx` (mempool) and `hashblock` (new blocks). On each new block it pulls the full block and updates its state — no polling.
+- **Correct chain-follow (gaps vs reorgs).** ZMQ delivery is best-effort, so on a busy or starved box a `hashblock` message can be missed. When a new block's parent isn't the current tip, the indexer tells the two cases apart: a block *ahead* of the tip means missed blocks (a **gap**) → it backfills the missed canonical blocks forward from the node; a block *at or below* the tip means a **reorg** → it orphans only the divergent segment by canonical comparison, walking back exactly to the common ancestor. Both paths are **bounded**, so neither a gap nor a fork can grind the index against canonical history; if a bound is ever hit (it shouldn't be — real BSV reorgs are 1–2 blocks), the indexer sets a **`degraded`** flag visible in `/health` instead of failing silently.
 - **Forward UTXO index (in-memory).** Per-address UTXO tracking for addresses you've queried, spend-tracked (an input that spends a tracked output removes it).
 - **Recently-seen window (in-memory).** `txid → height` for the last ~144 blocks (~24h), so you can answer "is this confirmed (or in mempool) right now?" quickly. Rebuilds from the firehose after a restart.
 - **Proof store (on disk, persistent).** One small file per captured proof, written atomically. This must persist: a pruned node won't have the block later, so the proof is captured the moment the block arrives and kept.
@@ -35,7 +36,7 @@ An app asks the chain exactly two things, and they ride different rails:
 | Method / path | Purpose | Success response |
 |---|---|---|
 | `GET /` | zero-dep web dashboard (status + in-browser proof verifier + address lookup) | `text/html` |
-| `GET /health` | node + index stats | `{ ok, blocks, pruned, index:{ blocks, blockTxs, memTxs, lastBlock, watched, seen } }` |
+| `GET /health` | node + index stats | `{ ok, blocks, pruned, index:{ blocks, blockTxs, memTxs, lastBlock, degraded, watched, seen } }` |
 | `GET /unspent/:address` | address UTXOs (node-validated) | `{ address, source, unspent:[{ tx_hash, tx_pos, value, height }] }` |
 | `POST /validate` `{ outpoints:["txid:vout", …] }` | filter outpoints to those still unspent (per `gettxout`) | `{ checked, survived, unspent:[{ tx_hash, tx_pos, value, height, address }] }` |
 | `GET /seen/:txid` | recently-confirmed or in mempool? | `{ txid, exists, source:"block"\|"mempool"\|"out-of-window", height }` |
@@ -113,6 +114,7 @@ A `/proof` that returns `verified:true` and recomputes (per "Verifying a proof y
 | `/validate` returns unvalidated candidates | node RPC unavailable | transient — restore the node; reads degrade gracefully meanwhile |
 | `/proof/:txid` stuck on `pending` | the tx hasn't been mined yet | confirm it's in the mempool; only re-broadcast if it's genuinely absent (never re-broadcast a tx that already relayed) |
 | `/proof/:txid` returns `410` | the block was reorged; the proof was invalidated | wait for the tx to re-confirm in the new chain; a fresh intent re-captures it |
+| `/health` shows `index.degraded` set | the indexer fell behind beyond its backfill bound, or a reorg exceeded the walk depth (both rare) | restart the indexer to resync forward from the node; if a deep reorg left proofs partial, clear the proof store for the affected range and re-register intents |
 
 ---
 

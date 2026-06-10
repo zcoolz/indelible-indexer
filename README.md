@@ -72,5 +72,7 @@ Run only what you need; each is independent and speaks plain HTTP.
 ## 🔒 Sovereignty notes
 Your node is the only authority — out of the box the indexer calls **no third party at all**. Cold-address enumeration is opt-in (`GP_HINT`, https-only, off by default); even when you enable it, every candidate it returns is re-validated through your node, and it never touches the proof path. Firewall `:9201` to your own consumers; it's built to sit behind a trust boundary.
 
+It also **follows the chain correctly through reorgs and missed blocks** — telling a fork apart from a gap, bounding both so neither can grind the index against canonical history, and surfacing any `degraded` state in `/health` rather than silently serving a stale tip.
+
 ## 📄 License
 [MIT](./LICENSE) — run it, fork it, ship it. Built by the **Indelible Federation**.

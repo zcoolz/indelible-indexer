@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url'
 import { Subscriber } from 'zeromq'
 import { merkleBranch, computeMerkleRoot } from './merkle.mjs'
 import { initProofStore, isPending, addPendingIntent, saveProof, loadProof, markOrphaned } from './proofStore.mjs'
+import { classifyBlock, planOrphans, MAX_REORG_DEPTH, MAX_BACKFILL } from './chainsync.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const DATADIR = process.env.BSV_DATADIR || '/data/bitcoin'
@@ -62,7 +63,7 @@ const utxos = new Map()                   // address -> Map("txid:vout" -> {valu
 const track = (a) => { if (!utxos.has(a)) utxos.set(a, new Map()) }
 const addUtxo = (a, txid, vout, value, height) => { track(a); utxos.get(a).set(`${txid}:${vout}`, { value, height }) }
 const spend = (txid, vout) => { const k = `${txid}:${vout}`; for (const m of utxos.values()) if (m.delete(k)) return }
-const stats = { blocks: 0, blockTxs: 0, memTxs: 0, lastBlock: null, started: Date.now() }
+const stats = { blocks: 0, blockTxs: 0, memTxs: 0, lastBlock: null, started: Date.now(), degraded: null }
 
 // seen-txid index for the g-189 share chain-check (WoC swap): a rolling window of
 // recently-CONFIRMED txids the node already streams via ZMQ. Memory bounded by the block
@@ -145,6 +146,94 @@ async function generateProofForConfirmed (txid) {
   return record
 }
 
+// ── g-286 block-follow: ingest one block, reconcile gaps/reorgs correctly ──
+
+// Apply ONE canonical block to the index and advance the tip. Used by both the
+// live ZMQ path and the gap-backfill path. (Caller guarantees correct ordering.)
+function ingestBlock (blk) {
+  for (const tx of blk.tx) { applyTx(tx, blk.height); if (tx.txid) seenTxids.set(tx.txid, blk.height) }
+  pruneSeen(blk.height)
+  stats.blocks++; stats.blockTxs += blk.tx.length; stats.lastBlock = blk.height
+  lastTip = { blockHash: blk.hash, height: blk.height }
+  console.log(`[indexer] block ${blk.height}: ${blk.tx.length} txs applied (watched=${watched.size})`)
+
+  // g-268 capture-at-ingest: persist proofs for interested txids only.
+  const interested = []
+  for (let i = 0; i < blk.tx.length; i++) {
+    const tx = blk.tx[i]
+    if (tx.txid && (isPending(tx.txid) || txTouchesWatched(tx))) interested.push(i)
+  }
+  if (interested.length > 0) {
+    const orderedTxids = blk.tx.map(t => t.txid)
+    if (computeMerkleRoot(orderedTxids) !== blk.merkleroot) {
+      console.error(`[proof] block ${blk.height} merkleroot mismatch — skipping capture`)
+    } else {
+      for (const i of interested) {
+        const { nodes, index } = merkleBranch(orderedTxids, i)
+        // Fire-and-forget [pack diff #4]: disk I/O must not stall ZMQ block ingest.
+        saveProof({ txid: orderedTxids[i], blockHash: blk.hash, height: blk.height, merkleRoot: blk.merkleroot, proof: { nodes, index }, verified: true })
+          .catch(e => console.error(`[proof] saveProof failed for ${orderedTxids[i]}: ${e.message}`))
+      }
+      console.log(`[proof] block ${blk.height}: captured ${interested.length} proof(s)`)
+    }
+  }
+}
+
+// Backfill canonical blocks we MISSED (ZMQ dropped hashblock messages while the
+// box was starved). NOT a reorg — fetch each by height from the node's canonical
+// chain and ingest it. Bounded so a huge gap can't block ingest for hours. [g-286]
+async function backfillForward (fromHeight, toHeight) {
+  const span = toHeight - fromHeight + 1
+  if (span > MAX_BACKFILL) {
+    stats.degraded = `gap ${fromHeight}..${toHeight} (${span} blks) exceeded MAX_BACKFILL=${MAX_BACKFILL} — jumped to tip, ${span} blocks uncaptured`
+    console.error(`[indexer] ${stats.degraded}`)
+    return
+  }
+  console.log(`[indexer] fell behind — backfilling missed canonical blocks ${fromHeight}..${toHeight} (${span}) [not a reorg]`)
+  for (let h = fromHeight; h <= toHeight; h++) {
+    const hash = await rpc('getblockhash', [h])
+    ingestBlock(await rpc('getblock', [hash, 2]))
+  }
+}
+
+// Orphan our tip's divergent segment after a fork, found by CANONICAL comparison
+// (planOrphans) so the walk stops exactly at the common ancestor and can never
+// grind canonical history. If the bounded plan hits the cap (should never happen
+// for a real BSV reorg — they're 1-2 blocks), set the degraded flag so the bad
+// state is operator-visible in /health rather than silent. [g-286]
+async function orphanDivergent (fromHash, fromHeight) {
+  const getCanonHash = (h) => rpc('getblockhash', [h]).catch(() => null)
+  const getBlock = (hash) => rpc('getblock', [hash, 1]).catch(() => null)
+  const { toOrphan, hitCap } = await planOrphans(fromHash, fromHeight, getCanonHash, getBlock)
+  if (hitCap) {
+    stats.degraded = `reorg walk hit MAX_REORG_DEPTH=${MAX_REORG_DEPTH} @${fromHeight} — partial orphan, needs manual rebuild`
+    console.error(`[proof] ${stats.degraded}`)
+  }
+  for (const b of toOrphan) {
+    await markOrphaned(b.txids)
+    for (const t of b.txids) seenTxids.delete(t)
+    console.log(`[proof] reorg: orphaned ${b.txids.length} txids @${b.height}`)
+  }
+}
+
+// Reconcile a freshly-announced block with our tip, then ingest it. The heart of
+// g-286: a parent mismatch is a GAP (we fell behind → backfill forward) when the
+// block is ahead of us, and only a REORG (bounded walk-back) when it's at/below
+// our tip — never the unbounded backward walk that wedged the indexer.
+async function onNewBlock (blk) {
+  const c = classifyBlock(lastTip, blk)
+  if (c.action === 'gap') {
+    // If our tip ALSO went non-canonical during the gap (a reorg happened too),
+    // orphan the divergent segment first; then backfill canonical blocks forward.
+    const canonAtTip = await rpc('getblockhash', [lastTip.height]).catch(() => null)
+    if (canonAtTip && canonAtTip !== lastTip.blockHash) await orphanDivergent(lastTip.blockHash, lastTip.height)
+    await backfillForward(c.from, c.to)
+  } else if (c.action === 'reorg') {
+    await orphanDivergent(lastTip.blockHash, lastTip.height)
+  }
+  ingestBlock(blk)
+}
+
 // ---- ZMQ ingest ----
 async function ingest () {
   const sock = new Subscriber()
@@ -156,51 +245,7 @@ async function ingest () {
     const topic = topicBuf.toString()
     try {
       if (topic === 'hashblock') {
-        const blk = await rpc('getblock', [body.toString('hex'), 2])
-        for (const tx of blk.tx) { applyTx(tx, blk.height); if (tx.txid) seenTxids.set(tx.txid, blk.height) }
-        pruneSeen(blk.height)
-        stats.blocks++; stats.blockTxs += blk.tx.length; stats.lastBlock = blk.height
-        console.log(`[indexer] block ${blk.height}: ${blk.tx.length} txs applied (watched=${watched.size})`)
-
-        // g-268 reorg detection: if this block's parent isn't our last tip, the
-        // old tip(s) were orphaned. Walk the orphaned chain back to the common
-        // ancestor (= the new block's parent), invalidating proofs + evicting
-        // txids from seenTxids at each step so a multi-block reorg can't leave a
-        // stale proof marked verified or a stale height queryable. [pack diff #1]
-        if (lastTip && blk.previousblockhash && blk.previousblockhash !== lastTip.blockHash) {
-          let cursor = lastTip.blockHash
-          while (cursor && cursor !== blk.previousblockhash) {
-            try {
-              const orphan = await rpc('getblock', [cursor, 1])
-              await markOrphaned(orphan.tx)
-              for (const t of orphan.tx) seenTxids.delete(t)
-              console.log(`[proof] reorg: orphaned ${orphan.tx.length} txids from height ${orphan.height}`)
-              cursor = orphan.previousblockhash
-            } catch (e) { console.error(`[proof] reorg walk failed at ${cursor}: ${e.message}`); break }
-          }
-        }
-        lastTip = { blockHash: blk.hash, height: blk.height }
-
-        // g-268 capture-at-ingest: persist proofs for interested txids only.
-        const interested = []
-        for (let i = 0; i < blk.tx.length; i++) {
-          const tx = blk.tx[i]
-          if (tx.txid && (isPending(tx.txid) || txTouchesWatched(tx))) interested.push(i)
-        }
-        if (interested.length > 0) {
-          const orderedTxids = blk.tx.map(t => t.txid)
-          if (computeMerkleRoot(orderedTxids) !== blk.merkleroot) {
-            console.error(`[proof] block ${blk.height} merkleroot mismatch — skipping capture`)
-          } else {
-            for (const i of interested) {
-              const { nodes, index } = merkleBranch(orderedTxids, i)
-              // Fire-and-forget [pack diff #4]: disk I/O must not stall ZMQ block ingest.
-              saveProof({ txid: orderedTxids[i], blockHash: blk.hash, height: blk.height, merkleRoot: blk.merkleroot, proof: { nodes, index }, verified: true })
-                .catch(e => console.error(`[proof] saveProof failed for ${orderedTxids[i]}: ${e.message}`))
-            }
-            console.log(`[proof] block ${blk.height}: captured ${interested.length} proof(s)`)
-          }
-        }
+        await onNewBlock(await rpc('getblock', [body.toString('hex'), 2]))
       } else if (topic === 'rawtx') {
         applyTx(await rpc('decoderawtransaction', [body.toString('hex')]), -1)
         stats.memTxs++
