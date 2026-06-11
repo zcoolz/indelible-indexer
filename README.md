@@ -51,23 +51,24 @@ Open `http://127.0.0.1:9201/` for the built-in **Proof Explorer**: paste a txid 
 | `GET /proof/:txid` | Merkle inclusion proof `{blockHash, height, merkleRoot, proof}` |
 | `POST /proof-intent` | capture a proof the moment a tx confirms |
 
-## 🏛️ How it fits
+## 🏛️ How it fits — the sovereign stack
 ```
-        your BSV node            (the source of truth)
-              │  loopback RPC + ZMQ
-        ┌─────▼─────────┐
-        │   Indelible   │        ← this repo  (HTTP :9201)
-        │    Indexer    │
-        └─────┬─────────┘
-              │  HTTP (firewalled to you)
-     your bridge · app · wallet  (the consumer)
+                    your BSV node
+                       │  RPC + ZMQ
+            ┌──────────┴───────────┐
+      indelible-indexer       indelible-overlay
+      (chain truth + proofs)   (service discovery)
+            └──────────┬───────────┘
+              relay-federation bridge      ← reads chain truth from THIS indexer,
+                       │  HTTP                advertises its services on the overlay
+              your apps · agents · wallets
 ```
-The indexer is one of three small, independent pieces you can run sovereignly:
-- **indelible-indexer** — this repo (chain truth + inclusion proofs).
-- **bsv-node-dashboard** — a zero-dependency monitor for the node itself *(separate repo)*.
-- a federation **bridge** — the service layer your apps talk to.
+The indexer is one piece of a small stack you run entirely yourself:
+- **indelible-indexer** — this repo: chain truth + inclusion proofs.
+- **[indelible-overlay](https://github.com/zcoolz/indelible-overlay)** — service discovery: where agents advertise + find each other.
+- **[relay-federation](https://github.com/zcoolz/relay-federation)** — the **Relay Federation Bridge**, which *is* the **SPV node** (a bridge and an SPV node are the same thing). A lightweight node — no full node of its own — that reads chain truth from this indexer *and* advertises its services on the overlay. It's the service layer your apps and agents actually talk to.
 
-Run only what you need; each is independent and speaks plain HTTP.
+Each runs independently and speaks plain HTTP — but the **bridge is what turns the pieces into a working stack.** *(Optional extra: a zero-dep node monitor, bsv-node-dashboard.)*
 
 ## 🔒 Sovereignty notes
 Your node is the only authority — out of the box the indexer calls **no third party at all**. Cold-address enumeration is opt-in (`GP_HINT`, https-only, off by default); even when you enable it, every candidate it returns is re-validated through your node, and it never touches the proof path. Firewall `:9201` to your own consumers; it's built to sit behind a trust boundary.
