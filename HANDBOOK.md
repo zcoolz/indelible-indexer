@@ -4,6 +4,8 @@ A small, generic indexer that runs **next to your own BSV node** and answers the
 
 > Repo: <https://github.com/zcoolz/indelible-indexer> · MIT. The 60-second start is in the [README](./README.md); this is the full operator reference.
 
+**Where it fits.** The indexer is one piece of a small sovereign stack: your full node + this indexer (chain truth) + an [overlay](https://github.com/zcoolz/indelible-overlay) (service discovery), tied together by the **[Relay Federation Bridge](https://github.com/zcoolz/relay-federation)** — an **SPV node** (a bridge *is* an SPV node) that reads chain truth from this indexer *and* advertises its services on the overlay. The bridge is the service layer your apps and agents actually talk to. (Full diagram in the [README](./README.md).)
+
 ---
 
 ## The two halves
