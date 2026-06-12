@@ -150,7 +150,45 @@ async function generateProofForConfirmed (txid) {
 
 // Apply ONE canonical block to the index and advance the tip. Used by both the
 // live ZMQ path and the gap-backfill path. (Caller guarantees correct ordering.)
-function ingestBlock (blk) {
+// Fetch a block for ingest. A mega-block's verbosity-2 JSON can exceed Node's max
+// string length (~512 MB) and throw — which previously wedged the backfill loop
+// forever, re-fetching the huge block each tick (and could OOM the node serving it).
+// Fall back to verbosity-1 (ordered txids + merkleroot, tiny) and ingest 'light':
+// record seen txids + capture proof-INTENTS, but skip the full UTXO-apply (gettxout
+// stays the UTXO authority). The indexer advances past any block; never wedges, and
+// surfaces the light ingest in /health. [g-286 mega-block hardening]
+async function fetchBlockForIngest (hash) {
+  try {
+    return { blk: await rpc('getblock', [hash, 2]), light: false }
+  } catch (e) {
+    console.error(`[indexer] full block fetch failed (${(e.message || '').slice(0, 70)}) — light ingest via verbosity 1`)
+    return { blk: await rpc('getblock', [hash, 1]), light: true }
+  }
+}
+
+function ingestBlock (blk, light = false) {
+  if (light) {
+    // verbosity-1: blk.tx is the ordered txid array. Record seen + capture proof-intents
+    // only (no vout data to detect watched-address txs); skip UTXO-apply — gettxout
+    // remains authoritative, so the next watched-address query self-corrects.
+    for (const txid of blk.tx) seenTxids.set(txid, blk.height)
+    pruneSeen(blk.height)
+    stats.blocks++; stats.blockTxs += blk.tx.length; stats.lastBlock = blk.height
+    lastTip = { blockHash: blk.hash, height: blk.height }
+    stats.degraded = `block ${blk.height} oversized — LIGHT ingest (proofs-by-intent only; UTXO via gettxout)`
+    console.warn(`[indexer] block ${blk.height}: LIGHT ingest (${blk.tx.length} txids; UTXO-apply skipped)`)
+    const interested = []
+    for (let i = 0; i < blk.tx.length; i++) if (isPending(blk.tx[i])) interested.push(i)
+    if (interested.length > 0 && computeMerkleRoot(blk.tx) === blk.merkleroot) {
+      for (const i of interested) {
+        const { nodes, index } = merkleBranch(blk.tx, i)
+        saveProof({ txid: blk.tx[i], blockHash: blk.hash, height: blk.height, merkleRoot: blk.merkleroot, proof: { nodes, index }, verified: true })
+          .catch(e => console.error(`[proof] saveProof failed for ${blk.tx[i]}: ${e.message}`))
+      }
+      console.log(`[proof] block ${blk.height}: captured ${interested.length} intent proof(s) (light)`)
+    }
+    return
+  }
   for (const tx of blk.tx) { applyTx(tx, blk.height); if (tx.txid) seenTxids.set(tx.txid, blk.height) }
   pruneSeen(blk.height)
   stats.blocks++; stats.blockTxs += blk.tx.length; stats.lastBlock = blk.height
@@ -192,7 +230,8 @@ async function backfillForward (fromHeight, toHeight) {
   console.log(`[indexer] fell behind — backfilling missed canonical blocks ${fromHeight}..${toHeight} (${span}) [not a reorg]`)
   for (let h = fromHeight; h <= toHeight; h++) {
     const hash = await rpc('getblockhash', [h])
-    ingestBlock(await rpc('getblock', [hash, 2]))
+    const { blk, light } = await fetchBlockForIngest(hash)
+    ingestBlock(blk, light)
   }
 }
 
@@ -220,7 +259,7 @@ async function orphanDivergent (fromHash, fromHeight) {
 // g-286: a parent mismatch is a GAP (we fell behind → backfill forward) when the
 // block is ahead of us, and only a REORG (bounded walk-back) when it's at/below
 // our tip — never the unbounded backward walk that wedged the indexer.
-async function onNewBlock (blk) {
+async function onNewBlock (blk, light = false) {
   const c = classifyBlock(lastTip, blk)
   if (c.action === 'gap') {
     // If our tip ALSO went non-canonical during the gap (a reorg happened too),
@@ -231,7 +270,7 @@ async function onNewBlock (blk) {
   } else if (c.action === 'reorg') {
     await orphanDivergent(lastTip.blockHash, lastTip.height)
   }
-  ingestBlock(blk)
+  ingestBlock(blk, light)
 }
 
 // ---- ZMQ ingest ----
@@ -245,7 +284,8 @@ async function ingest () {
     const topic = topicBuf.toString()
     try {
       if (topic === 'hashblock') {
-        await onNewBlock(await rpc('getblock', [body.toString('hex'), 2]))
+        const { blk, light } = await fetchBlockForIngest(body.toString('hex'))
+        await onNewBlock(blk, light)
       } else if (topic === 'rawtx') {
         applyTx(await rpc('decoderawtransaction', [body.toString('hex')]), -1)
         stats.memTxs++
